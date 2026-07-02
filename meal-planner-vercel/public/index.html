@@ -662,6 +662,7 @@ function App() {
   const [addMealModal, setAddMealModal] = useState(false);
   const [scanModal, setScanModal] = useState(false);
   const [scanMode, setScanMode] = useState("barcode"); // "barcode" | "label"
+  const [scanTarget, setScanTarget] = useState("default"); // "default" | "editFood"
   const [barcodeBuffer, setBarcodeBuffer] = useState(""); // accumulates keystrokes from USB barcode scanners
   const barcodeTimer = useRef(null);
 
@@ -1068,6 +1069,22 @@ function App() {
   const applyScanResult = () => {
     if(!scanResult||scanResult.error) return;
     const foodName = scanResult.brand ? `${scanResult.name} (${scanResult.brand})` : scanResult.name;
+
+    // If opened from edit food modal — pipe values back into the edit fields, don't create a new food
+    if(scanTarget==="editFood" && editFoodModal) {
+      setEditFoodModal(prev=>({
+        ...prev,
+        name: foodName || prev.name,
+        unit: scanResult.unit || prev.unit,
+        calsPerUnit: String(scanResult.calsPerUnit || prev.calsPerUnit),
+        protein: String(scanResult.protein || prev.protein),
+        carbs: String(scanResult.carbs || prev.carbs),
+        fat: String(scanResult.fat || prev.fat),
+      }));
+      setScanModal(false); setScanResult(null); setScanTarget("default");
+      return;
+    }
+
     const food = upsertFood({
       name: foodName, unit: scanResult.unit||"serving",
       calsPerUnit: scanResult.calsPerUnit, protein: scanResult.protein,
@@ -1082,7 +1099,7 @@ function App() {
     if(quickMealModal && food) {
       setQuickMealItems(prev => [...prev, {foodId: food.id, qty: scanResult.servingSize||1, unit: scanResult.unit||"serving"}]);
     }
-    setScanModal(false); setScanResult(null);
+    setScanModal(false); setScanResult(null); setScanTarget("default");
   };
 
   // AI
@@ -2061,6 +2078,11 @@ Field rules:
           <div className="modal" onClick={e=>e.stopPropagation()}>
             <button className="modal-close" onClick={()=>setEditFoodModal(null)}>×</button>
             <h2>✏️ Edit Food</h2>
+            <p style={{fontSize:12,color:"#999",marginBottom:12}}>Update any values manually, or scan the barcode/label to pull in fresh nutrition info.</p>
+            <button className="btn btn-secondary" style={{width:"100%",marginBottom:14,justifyContent:"center"}}
+              onClick={()=>{setScanTarget("editFood");setScanResult(null);setScanModal(true);}}>
+              📷 Scan Barcode or Label to Update
+            </button>
             <div className="fg">
               <label className="fl">Food Name</label>
               <input className="fi" value={editFoodModal.name} onChange={e=>setEditFoodModal(p=>({...p,name:e.target.value}))}/>
@@ -2290,7 +2312,7 @@ Field rules:
               <div style={{display:"flex",gap:8,justifyContent:"flex-end",flexWrap:"wrap"}}>
                 <button className="btn btn-secondary btn-sm" onClick={()=>{setScanResult(null);}}>Scan Again</button>
                 <button className="btn btn-primary btn-sm" onClick={applyScanResult}>
-                  {ingModal||quickMealModal ? "+ Add to Meal" : "💾 Save to Foods"}
+                  {scanTarget==="editFood" ? "↩ Update Food Info" : ingModal||quickMealModal ? "+ Add to Meal" : "💾 Save to Foods"}
                 </button>
               </div>
             </div>}
