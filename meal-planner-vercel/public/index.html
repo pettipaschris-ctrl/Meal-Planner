@@ -16,7 +16,7 @@
 
 
 
-const ALL_DAYS = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"];
+const ALL_DAYS = ["Friday","Saturday","Sunday","Monday","Tuesday","Wednesday","Thursday"];
 const MEAL_TYPES = ["Breakfast","Lunch","Dinner","Snack"];
 const CALORIE_GOAL = 2000;
 
@@ -419,16 +419,20 @@ body{font-family:'Inter',sans-serif;background:#FFF8F0;color:#1A1A2E;-webkit-fon
 .week-strip::-webkit-scrollbar-track{background:#f0f0f0;border-radius:2px}
 .week-strip::-webkit-scrollbar-thumb{background:#ccc;border-radius:2px}
 .day-col{background:#fff;border-radius:14px;overflow:hidden;box-shadow:0 2px 10px rgba(0,0,0,.07);flex:0 0 168px;transition:all .2s;user-select:none}
-.day-col.drag-over{outline:2px solid #4CAF50;background:#F1FBF1}
-.day-col.dragging{opacity:.4;transform:scale(.97)}
 .day-col.today-col{outline:2px solid #4CAF50}
-.day-hdr{padding:10px 10px 8px;display:flex;align-items:center;justify-content:space-between;background:linear-gradient(135deg,#1A1A2E,#16213E);color:#fff;cursor:grab;gap:6px}
-.day-hdr:active{cursor:grabbing}
-.day-hdr-drag{opacity:.4;font-size:13px;flex-shrink:0}
-.day-hdr-info{flex:1;min-width:0}
+.day-hdr{padding:8px 8px 6px;display:flex;align-items:center;justify-content:space-between;background:linear-gradient(135deg,#1A1A2E,#16213E);color:#fff;gap:4px}
+.day-hdr-info{flex:1;min-width:0;text-align:center}
 .day-hdr-name{font-size:11px;font-weight:800;letter-spacing:.5px;text-transform:uppercase}
 .day-hdr-cals{font-size:10px;opacity:.65;margin-top:1px}
 .day-hdr-today{font-size:9px;background:rgba(76,175,80,.35);color:#A5D6A7;padding:2px 6px;border-radius:20px;flex-shrink:0;font-weight:700}
+.day-move-btn{background:rgba(255,255,255,.15);border:none;color:rgba(255,255,255,.8);width:22px;height:22px;border-radius:5px;font-size:12px;cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0;font-family:inherit;transition:background .15s}
+.day-move-btn:hover{background:rgba(255,255,255,.3)}
+.day-move-btn:disabled{opacity:.2;cursor:default}
+.reorder-mode-btn{font-size:11px;font-weight:700;padding:6px 12px;border-radius:8px;border:1.5px solid #DDD;background:#fff;cursor:pointer;font-family:inherit;transition:all .2s}
+.reorder-mode-btn.active{border-color:#FF7043;background:#FFF3F0;color:#FF7043}
+.leftovers-btn{position:absolute;bottom:4px;right:40px;background:#FFF8E1;color:#F57F17;border:none;border-radius:4px;width:16px;height:16px;font-size:9px;cursor:pointer;display:flex;align-items:center;justify-content:center}
+.leftovers-option{display:flex;align-items:center;gap:12px;padding:12px;border-radius:10px;cursor:pointer;transition:background .15s;margin-bottom:6px}
+.leftovers-option:hover{background:#FFF8E1}
 .day-meals{padding:8px;display:flex;flex-direction:column;gap:5px;min-height:220px}
 .slot{border:1.5px dashed #E0E0E0;border-radius:9px;padding:6px 8px;font-size:10px;color:#bbb;cursor:pointer;transition:all .15s;min-height:54px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px}
 .slot:hover{border-color:#4CAF50;color:#4CAF50;background:#F0FAF0}
@@ -636,8 +640,8 @@ function App() {
   const [foods, setFoods] = useState(SAMPLE_FOODS);
   const [dayOrder, setDayOrder] = useState(ALL_DAYS);
   const [plan, setPlan] = useState({});
-  const [dragDay, setDragDay] = useState(null);
-  const [overDay, setOverDay] = useState(null);
+  const [reorderMode, setReorderMode] = useState(false);
+  const [leftoversModal, setLeftoversModal] = useState(null); // {day, mealType, meal}
 
   const [pickerModal, setPickerModal] = useState(null);
   const [ingModal, setIngModal] = useState(null);
@@ -746,18 +750,42 @@ function App() {
   const [scanLoading, setScanLoading] = useState(false);
 
   // Drag reorder
-  const onDayDragStart = (e, day) => { setDragDay(day); e.dataTransfer.effectAllowed="move"; };
-  const onDayDragOver  = (e, day) => { e.preventDefault(); setOverDay(day); };
-  const onDayDrop = (e, day) => {
-    e.preventDefault();
-    if (!dragDay || dragDay===day) { setDragDay(null); setOverDay(null); return; }
+  // Tap-based day reordering (works on mobile)
+  const moveDayLeft = (day) => {
     setDayOrder(prev => {
-      const arr=[...prev], fi=arr.indexOf(dragDay), ti=arr.indexOf(day);
-      arr.splice(fi,1); arr.splice(ti,0,dragDay); return arr;
+      const arr = [...prev];
+      const idx = arr.indexOf(day);
+      if(idx <= 0) return arr;
+      [arr[idx-1], arr[idx]] = [arr[idx], arr[idx-1]];
+      return arr;
     });
-    setDragDay(null); setOverDay(null);
   };
-  const onDayDragEnd = () => { setDragDay(null); setOverDay(null); };
+  const moveDayRight = (day) => {
+    setDayOrder(prev => {
+      const arr = [...prev];
+      const idx = arr.indexOf(day);
+      if(idx >= arr.length-1) return arr;
+      [arr[idx], arr[idx+1]] = [arr[idx+1], arr[idx]];
+      return arr;
+    });
+  };
+
+  // Leftovers — copy a dinner to the next day's lunch
+  const applyLeftovers = (day, mealType, targetMealType) => {
+    const meal = plan[day]?.[mealType];
+    if(!meal) return;
+    const dayIdx = dayOrder.indexOf(day);
+    const nextDay = dayOrder[dayIdx + 1];
+    if(!nextDay) { alert("No next day in your week to add leftovers to."); return; }
+    setPlan(prev => ({
+      ...prev,
+      [nextDay]: {
+        ...(prev[nextDay]||{}),
+        [targetMealType]: { ...meal, name: meal.name + " (Leftovers)" }
+      }
+    }));
+    setLeftoversModal(null);
+  };
 
   const getTodayName = () => { const d=new Date().getDay(); return ALL_DAYS[d===0?6:d-1]; };
   const todayName = getTodayName();
@@ -1038,39 +1066,89 @@ Replace null values with meal name strings where a meal is planned. Keep null wh
 
   const applyWeekPlan = () => {
     if(!wpPreview) return;
-    // Build combined lookup: existing library + any new meals from the plan
-    const newMealObjects = (wpPreview.newMeals||[]).map(m => ({
-      ...m, id: Date.now() + Math.random(), tags: m.tags||["planned"]
-    }));
-    // Update library with new meals
-    if(newMealObjects.length > 0) setMeals(prev => [...prev, ...newMealObjects]);
-    // All meals available for lookup (library snapshot + new)
-    const allMeals = [...(wpPreview._snapshot || meals), ...newMealObjects];
-    const findMeal = name => allMeals.find(m => m.name.toLowerCase().trim() === name.toLowerCase().trim());
-    // Build the new plan
-    const newPlan = {};
-    ALL_DAYS.forEach(day => {
-      const daySlots = wpPreview.plan[day] || {};
-      newPlan[day] = {};
-      MEAL_TYPES.forEach(type => {
-        const mealName = daySlots[type];
-        if(!mealName) return;
-        const found = findMeal(mealName);
-        if(found) newPlan[day][type] = found;
-        // If not found by exact match, create a stub so the slot isn't empty
-        else newPlan[day][type] = {
-          id: Date.now()+Math.random(), name: mealName, emoji:"🍽️",
-          tags:["planned"], ingredients:[{id:"s1",name:mealName,qty:1,unit:"serving",calsPerUnit:400,protein:20,carbs:40,fat:15}]
-        };
+    try {
+      // Build new meal objects with safe string IDs
+      const newMealObjects = (wpPreview.newMeals||[]).map((m,i) => ({
+        ...m,
+        id: "planned_" + Date.now() + "_" + i,
+        tags: m.tags||["planned"],
+        ingredients: (m.ingredients||[]).map((ing,j) => ({
+          ...ing,
+          id: "pi_" + Date.now() + "_" + j,
+          qty: Number(ing.qty)||1,
+          calsPerUnit: Number(ing.calsPerUnit)||0,
+          protein: Number(ing.protein)||0,
+          carbs: Number(ing.carbs)||0,
+          fat: Number(ing.fat)||0,
+        }))
+      }));
+
+      // Combined lookup: snapshot meals + new meals
+      const libraryMeals = wpPreview._snapshot || meals;
+      const allMeals = [...libraryMeals, ...newMealObjects];
+
+      const findMeal = (name) => {
+        if(!name) return null;
+        const normalized = name.toLowerCase().trim();
+        return allMeals.find(m => m.name && m.name.toLowerCase().trim() === normalized) || null;
+      };
+
+      // Build the plan — only include days/slots that actually have a meal
+      const newPlan = {};
+      ALL_DAYS.forEach(day => {
+        const daySlots = wpPreview.plan?.[day] || {};
+        const dayMeals = {};
+        MEAL_TYPES.forEach(type => {
+          const mealName = daySlots[type];
+          if(!mealName || typeof mealName !== "string") return;
+          const found = findMeal(mealName);
+          if(found) {
+            dayMeals[type] = found;
+          } else {
+            // Stub for meals not in library — safe IDs and required fields
+            dayMeals[type] = {
+              id: "stub_" + day + "_" + type + "_" + Date.now(),
+              name: mealName,
+              emoji: "🍽️",
+              tags: ["planned"],
+              ingredients: [{
+                id: "stub_ing_" + Date.now(),
+                name: mealName,
+                qty: 1,
+                unit: "serving",
+                calsPerUnit: 400,
+                protein: 20,
+                carbs: 40,
+                fat: 15
+              }]
+            };
+          }
+        });
+        if(Object.keys(dayMeals).length > 0) newPlan[day] = dayMeals;
       });
-    });
-    setPlan(prev => {
-      const merged = {...prev};
-      ALL_DAYS.forEach(day => { merged[day] = {...(merged[day]||{}), ...newPlan[day]}; });
-      return merged;
-    });
-    setWpPreview(null);
-    setTab("planner");
+
+      // Add new meals to library
+      if(newMealObjects.length > 0) {
+        setMeals(prev => [...prev, ...newMealObjects]);
+      }
+
+      // Merge into existing plan
+      setPlan(prev => {
+        const merged = {...prev};
+        ALL_DAYS.forEach(day => {
+          if(newPlan[day]) {
+            merged[day] = {...(merged[day]||{}), ...newPlan[day]};
+          }
+        });
+        return merged;
+      });
+
+      setWpPreview(null);
+      setTab("planner");
+    } catch(e) {
+      console.error("applyWeekPlan error:", e);
+      alert("Something went wrong applying the plan: " + e.message + ". Please try again.");
+    }
   };
 
   const getAiSuggestions = async () => {
@@ -1270,31 +1348,36 @@ Field rules:
             <div className="sec-hdr">
               <div>
                 <div className="sec-title">This Week</div>
-                <div style={{fontSize:11,color:"#aaa",marginTop:2}}>Drag day headers to reorder</div>
+                <div style={{fontSize:11,color:"#aaa",marginTop:2}}>{reorderMode ? "Tap ‹ › arrows to move days" : ""}</div>
               </div>
-              <button className="btn btn-secondary btn-sm" onClick={generateGrocery}>🛒 Grocery List</button>
+              <div style={{display:"flex",gap:8}}>
+                <button className={"reorder-mode-btn"+(reorderMode?" active":"")} onClick={()=>setReorderMode(p=>!p)}>
+                  {reorderMode ? "✓ Done" : "⇄ Reorder"}
+                </button>
+                <button className="btn btn-secondary btn-sm" onClick={generateGrocery}>🛒 Grocery</button>
+              </div>
             </div>
             <div className="week-strip">
-              {dayOrder.map(day=>{
+              {dayOrder.map((day,dayIdx)=>{
                 const dayCals=getDayCalories(day);
                 const isToday=day===todayName;
                 const pct=Math.min(100,(dayCals/CALORIE_GOAL)*100);
                 return (
-                  <div key={day}
-                    className={"day-col"+(isToday?" today-col":"")+(dragDay===day?" dragging":"")+(overDay===day&&dragDay!==day?" drag-over":"")}
-                    onDragOver={e=>onDayDragOver(e,day)} onDrop={e=>onDayDrop(e,day)} onDragEnd={onDayDragEnd}>
-                    <div className="day-hdr" draggable onDragStart={e=>onDayDragStart(e,day)}>
-                      <span className="day-hdr-drag">⠿</span>
+                  <div key={day} className={"day-col"+(isToday?" today-col":"")}>
+                    <div className="day-hdr">
+                      {reorderMode&&<button className="day-move-btn" disabled={dayIdx===0} onClick={()=>moveDayLeft(day)}>‹</button>}
                       <div className="day-hdr-info">
-                        <div className="day-hdr-name">{day.slice(0,3)}</div>
+                        <div className="day-hdr-name">{day.slice(0,3)}{isToday&&" ●"}</div>
                         <div className="day-hdr-cals">{dayCals>0?dayCals+" cal":"—"}</div>
                       </div>
-                      {isToday&&<span className="day-hdr-today">TODAY</span>}
+                      {isToday&&!reorderMode&&<span className="day-hdr-today">TODAY</span>}
+                      {reorderMode&&<button className="day-move-btn" disabled={dayIdx===dayOrder.length-1} onClick={()=>moveDayRight(day)}>›</button>}
                     </div>
                     <div className="day-meals">
                       {MEAL_TYPES.map(type=>{
                         const meal=plan[day]?.[type];
                         const mCals=meal?calcMealTotals(meal.ingredients).calories:0;
+                        const canHaveLeftovers = meal && (type==="Dinner" || type==="Lunch") && dayIdx < dayOrder.length-1;
                         return (
                           <div key={type} className={"slot"+(meal?" filled":"")} onClick={()=>!meal&&setPickerModal({day,mealType:type})}>
                             {meal?(<>
@@ -1303,6 +1386,7 @@ Field rules:
                               <div className="slot-name" style={{cursor:"pointer"}} onClick={e=>{e.stopPropagation();setViewRecipeModal(meal);}}>{meal.name}</div>
                               <div className="slot-cals">{mCals} cal</div>
                               <button className="slot-edit" title="Edit nutrition" onClick={e=>{e.stopPropagation();openIngModal(day,type);}}>✏️</button>
+                              {canHaveLeftovers&&<button className="leftovers-btn" title="Use as leftovers" onClick={e=>{e.stopPropagation();setLeftoversModal({day,mealType:type,meal});}}>📦</button>}
                               <button className="slot-remove" onClick={e=>{e.stopPropagation();removeMeal(day,type);}}>×</button>
                             </>):(<><div className="slot-type">{type}</div><div style={{fontSize:18}}>+</div></>)}
                           </div>
@@ -1702,6 +1786,31 @@ Field rules:
                   </div>
                 </div>;
               })}
+          </div>
+        </div>}
+
+        {/* LEFTOVERS MODAL */}
+        {leftoversModal&&<div className="overlay" onClick={()=>setLeftoversModal(null)}>
+          <div className="modal" onClick={e=>e.stopPropagation()} style={{maxWidth:380}}>
+            <button className="modal-close" onClick={()=>setLeftoversModal(null)}>×</button>
+            <h2>📦 Use as Leftovers</h2>
+            <p style={{fontSize:13,color:"#888",marginBottom:16,lineHeight:1.5}}>
+              Add <strong>{leftoversModal?.meal?.name}</strong> as leftovers on <strong>{dayOrder[dayOrder.indexOf(leftoversModal?.day)+1]}</strong>. Which meal slot?
+            </p>
+            {["Breakfast","Lunch","Dinner","Snack"].map(type=>(
+              <div key={type} className="leftovers-option" onClick={()=>applyLeftovers(leftoversModal.day, leftoversModal.mealType, type)}>
+                <div style={{fontSize:22}}>
+                  {type==="Breakfast"?"🌅":type==="Lunch"?"🥡":type==="Dinner"?"🍽️":"🍎"}
+                </div>
+                <div>
+                  <div style={{fontWeight:700,fontSize:14}}>{type}</div>
+                  <div style={{fontSize:11,color:"#aaa"}}>
+                    {dayOrder[dayOrder.indexOf(leftoversModal?.day)+1]} · {leftoversModal?.meal?.name} (Leftovers)
+                  </div>
+                </div>
+              </div>
+            ))}
+            <button className="btn btn-secondary" style={{width:"100%",marginTop:8,justifyContent:"center"}} onClick={()=>setLeftoversModal(null)}>Cancel</button>
           </div>
         </div>}
 
