@@ -383,6 +383,20 @@ function calcMealTotals(ingredients) {
   }), {calories:0,protein:0,carbs:0,fat:0});
 }
 
+// Returns per-serving nutrition. If meal has no servings set, returns full totals (assumes 1 serving).
+function calcPerServing(meal) {
+  const totals = calcMealTotals(meal.ingredients || []);
+  const servings = meal.servings && meal.servings > 1 ? meal.servings : 1;
+  return {
+    calories: Math.round(totals.calories / servings),
+    protein:  Math.round(totals.protein  / servings),
+    carbs:    Math.round(totals.carbs    / servings),
+    fat:      Math.round(totals.fat      / servings),
+    servings,
+    totalCalories: totals.calories, // keep full total accessible
+  };
+}
+
 function calColor(cals, goal=CALORIE_GOAL) {
   const p = cals/goal;
   if(p>1.1) return "#FF5252";
@@ -647,6 +661,19 @@ function App() {
   const [ingModal, setIngModal] = useState(null);
   const [addMealModal, setAddMealModal] = useState(false);
   const [scanModal, setScanModal] = useState(false);
+  const [scanMode, setScanMode] = useState("barcode"); // "barcode" | "label"
+  const [barcodeBuffer, setBarcodeBuffer] = useState(""); // accumulates keystrokes from USB barcode scanners
+  const barcodeTimer = useRef(null);
+
+  // Serving scaler — per recipe view session
+  const [recipeServings, setRecipeServings] = useState(null); // null = use original
+
+  // Meal ratings and notes
+  const [mealMeta, setMealMeta] = useState({}); // {mealId: {rating: 1-5, note: string}}
+  const [ratingModal, setRatingModal] = useState(null); // meal object
+
+  // Cook time filter in picker modal
+  const [pickerFilter, setPickerFilter] = useState("all"); // "all" | "quick" (≤30min) | "any protein tag"
   const [importModal, setImportModal] = useState(false);
   const [importUrl, setImportUrl] = useState("");
   const [importText, setImportText] = useState("");
@@ -790,7 +817,7 @@ function App() {
   const getTodayName = () => { const d=new Date().getDay(); return ALL_DAYS[d===0?6:d-1]; };
   const todayName = getTodayName();
 
-  const getDayCalories = day => Object.values(plan[day]||{}).reduce((s,m)=>s+(m?calcMealTotals(m.ingredients).calories:0),0);
+  const getDayCalories = day => Object.values(plan[day]||{}).reduce((s,m)=>s+(m?calcPerServing(m).calories:0),0);
   const todayCals = getDayCalories(todayName);
 
   const assignMeal = meal => {
@@ -927,6 +954,13 @@ function App() {
     setAddFoodModal(false);
   };
 
+  // Meal ratings and notes
+  const saveMealMeta = (mealId, rating, note) => {
+    setMealMeta(prev => ({...prev, [mealId]: {rating, note}}));
+    // Also update the meal in library
+    setMeals(prev => prev.map(m => m.id===mealId ? {...m, rating, note} : m));
+  };
+
   // Camera
   const startCamera = async () => {
     setScanning(true); setScanResult(null);
@@ -934,9 +968,45 @@ function App() {
       const stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:"environment"}});
       streamRef.current=stream;
       if(videoRef.current){ videoRef.current.srcObject=stream; videoRef.current.play(); }
-    } catch(e){ setScanning(false); alert("Camera not available in this environment. Try uploading a photo instead."); }
+    } catch(e){ setScanning(false); alert("Camera not available. Try uploading a photo instead."); }
   };
   const stopCamera = () => { streamRef.current?.getTracks().forEach(t=>t.stop()); setScanning(false); };
+
+  // Barcode lookup via Open Food Facts (free, no API key needed)
+  const lookupBarcode = async (barcode) => {
+    setScanLoading(true); setScanResult(null);
+    try {
+      const res = await fetch(`https://world.openfoodfacts.org/api/v0/product/${barcode}.json`);
+      const data = await res.json();
+      if(data.status !== 1 || !data.product) {
+        setScanResult({error:"not_found", barcode});
+        setScanLoading(false); return;
+      }
+      const p = data.product;
+      const n = p.nutriments || {};
+      const serving = p.serving_size || "100g";
+      const servingG = parseFloat(serving) || 100;
+      // Open Food Facts gives per-100g values
+      const factor = servingG / 100;
+      setScanResult({
+        name: p.product_name || p.product_name_en || "Unknown product",
+        brand: p.brands || "",
+        barcode,
+        unit: "serving",
+        servingSize: 1,
+        servingLabel: serving,
+        calsPerUnit: Math.round((n["energy-kcal_100g"] || n["energy_100g"] / 4.184 || 0) * factor),
+        protein: Math.round(((n.proteins_100g || 0) * factor) * 10) / 10,
+        carbs: Math.round(((n.carbohydrates_100g || 0) * factor) * 10) / 10,
+        fat: Math.round(((n.fat_100g || 0) * factor) * 10) / 10,
+        image: p.image_front_small_url || null,
+        category: p.categories_tags?.[0]?.replace("en:","") || "other"
+      });
+    } catch(e) {
+      setScanResult({error:"network", barcode});
+    }
+    setScanLoading(false);
+  };
 
   const analyzeImage = async (b64, mimeType="image/jpeg") => {
     setScanLoading(true);
@@ -944,12 +1014,20 @@ function App() {
       const res=await fetch("/api/claude",{method:"POST",headers:{"Content-Type":"application/json"},
         body:JSON.stringify({model:"claude-sonnet-4-6",max_tokens:800,messages:[{role:"user",content:[
           {type:"image",source:{type:"base64",media_type:mimeType,data:b64}},
-          {type:"text",text:"This is a nutrition label or food packaging. Extract the nutrition information and return ONLY a JSON object with no markdown, no explanation: {\"name\":string,\"calsPerUnit\":number,\"protein\":number,\"carbs\":number,\"fat\":number,\"unit\":\"g\"|\"ml\"|\"serving\",\"servingSize\":number}. calsPerUnit means calories per 1 unit (e.g. per 1g, per 1ml, per 1 serving). If you cannot read a nutrition label, return {\"error\":\"no_label\"}."}
+          {type:"text",text:scanMode==="barcode"
+            ? "This image contains a barcode. Read the barcode number and return ONLY a JSON object: {\"barcode\":\"the_number_as_string\"}. If you cannot read a barcode, return {\"error\":\"no_barcode\"}."
+            : "This is a nutrition label. Extract the nutrition information and return ONLY a JSON object: {\"name\":string,\"calsPerUnit\":number,\"protein\":number,\"carbs\":number,\"fat\":number,\"unit\":\"g\"|\"ml\"|\"serving\",\"servingSize\":number}. calsPerUnit = calories per 1 unit. If unreadable return {\"error\":\"no_label\"}."}
         ]}]})
       });
       const data=await res.json();
       const txt=data.content[0].text.replace(/```json|```/g,"").trim();
-      setScanResult(JSON.parse(txt));
+      const parsed=JSON.parse(txt);
+      if(scanMode==="barcode" && parsed.barcode) {
+        // Got barcode number — now look it up in Open Food Facts
+        await lookupBarcode(parsed.barcode);
+      } else {
+        setScanResult(parsed);
+      }
     } catch(e){ setScanResult({error:true}); }
     setScanLoading(false);
   };
@@ -972,18 +1050,20 @@ function App() {
 
   const applyScanResult = () => {
     if(!scanResult||scanResult.error) return;
-    // Auto-save to Food Library always
+    const foodName = scanResult.brand ? `${scanResult.name} (${scanResult.brand})` : scanResult.name;
     const food = upsertFood({
-      name: scanResult.name, unit: scanResult.unit||"g",
+      name: foodName, unit: scanResult.unit||"serving",
       calsPerUnit: scanResult.calsPerUnit, protein: scanResult.protein,
-      carbs: scanResult.carbs, fat: scanResult.fat, category: "scanned"
+      carbs: scanResult.carbs, fat: scanResult.fat,
+      category: scanResult.category || "scanned",
+      barcode: scanResult.barcode || null
     });
     if(ingModal) {
-      const newIng={id:"i"+Date.now(),name:scanResult.name,qty:scanResult.servingSize||100,unit:scanResult.unit||"g",calsPerUnit:scanResult.calsPerUnit,protein:scanResult.protein,carbs:scanResult.carbs,fat:scanResult.fat};
+      const newIng={id:"i"+Date.now(),name:foodName,qty:scanResult.servingSize||1,unit:scanResult.unit||"serving",calsPerUnit:scanResult.calsPerUnit,protein:scanResult.protein,carbs:scanResult.carbs,fat:scanResult.fat};
       setIngModal(prev=>({...prev,meal:{...prev.meal,ingredients:[...prev.meal.ingredients,newIng]}}));
     }
-    if(quickMealModal) {
-      setQuickMealItems(prev => [...prev, {foodId: food.id, qty: scanResult.servingSize||1, unit: scanResult.unit||"g"}]);
+    if(quickMealModal && food) {
+      setQuickMealItems(prev => [...prev, {foodId: food.id, qty: scanResult.servingSize||1, unit: scanResult.unit||"serving"}]);
     }
     setScanModal(false); setScanResult(null);
   };
@@ -1301,23 +1381,47 @@ Field rules:
   };
 
   // Grocery
+  const addGrocery = () => {
+    if(!newGrocery.trim()) return;
+    setGrocery(prev=>[...prev,{id:"g"+Date.now(),text:newGrocery.trim(),source:"manual",category:"other"}]);
+    setNewGrocery("");
+  };
+
+  const STORE_SECTIONS = [
+    {key:"produce",   label:"🥦 Produce",    cats:["produce"]},
+    {key:"meat",      label:"🥩 Meat",        cats:["meat"]},
+    {key:"seafood",   label:"🐟 Seafood",     cats:["seafood"]},
+    {key:"dairy",     label:"🥛 Dairy",       cats:["dairy"]},
+    {key:"grains",    label:"🌾 Grains & Bread", cats:["grains"]},
+    {key:"pantry",    label:"🥫 Pantry",      cats:["pantry","condiments"]},
+    {key:"snacks",    label:"🍎 Snacks",      cats:["snacks"]},
+    {key:"other",     label:"🛒 Other",       cats:["other","scanned","recipe","custom","planned","suggested"]},
+  ];
+
+  const getCategoryForIngredient = (ingName) => {
+    const food = foods.find(f => f.name.toLowerCase() === ingName.toLowerCase());
+    return food?.category || "other";
+  };
+
   const generateGrocery = () => {
     const map={};
     Object.values(plan).forEach(day=>Object.values(day).forEach(meal=>{
       meal?.ingredients?.forEach(ing=>{
         const k=ing.name.toLowerCase();
-        if(!map[k]) map[k]={text:ing.name,qty:0,unit:ing.unit,id:"g"+Date.now()+Math.random()};
+        if(!map[k]) map[k]={
+          text:ing.name, qty:0, unit:ing.unit,
+          id:"g"+Date.now()+Math.random(),
+          category: getCategoryForIngredient(ing.name)
+        };
         map[k].qty+=ing.qty;
       });
     }));
-    const gen=Object.values(map).map(i=>({...i,source:"plan",text:i.text+" ("+Math.round(i.qty*10)/10+" "+i.unit+")"}));
+    const gen=Object.values(map).map(i=>({
+      ...i, source:"plan",
+      text:i.text+" ("+Math.round(i.qty*10)/10+" "+i.unit+")"
+    }));
     setGrocery(prev=>[...prev.filter(i=>i.source==="manual"),...gen]);
     setTab("grocery");
-  };
-  const addGrocery = () => {
-    if(!newGrocery.trim()) return;
-    setGrocery(prev=>[...prev,{id:"g"+Date.now(),text:newGrocery.trim(),source:"manual"}]);
-    setNewGrocery("");
   };
 
   const filteredMeals=meals.filter(m=>m.name.toLowerCase().includes(search.toLowerCase()));
@@ -1376,7 +1480,7 @@ Field rules:
                     <div className="day-meals">
                       {MEAL_TYPES.map(type=>{
                         const meal=plan[day]?.[type];
-                        const mCals=meal?calcMealTotals(meal.ingredients).calories:0;
+                        const mCals=meal?calcPerServing(meal).calories:0;
                         const canHaveLeftovers = meal && (type==="Dinner" || type==="Lunch") && dayIdx < dayOrder.length-1;
                         return (
                           <div key={type} className={"slot"+(meal?" filled":"")} onClick={()=>!meal&&setPickerModal({day,mealType:type})}>
@@ -1384,7 +1488,7 @@ Field rules:
                               <span className="slot-emoji">{meal.emoji}</span>
                               <div className="slot-type">{type}</div>
                               <div className="slot-name" style={{cursor:"pointer"}} onClick={e=>{e.stopPropagation();setViewRecipeModal(meal);}}>{meal.name}</div>
-                              <div className="slot-cals">{mCals} cal</div>
+                              <div className="slot-cals">{mCals} cal{meal?.servings>1?"/srv":""}</div>
                               <button className="slot-edit" title="Edit nutrition" onClick={e=>{e.stopPropagation();openIngModal(day,type);}}>✏️</button>
                               {canHaveLeftovers&&<button className="leftovers-btn" title="Use as leftovers" onClick={e=>{e.stopPropagation();setLeftoversModal({day,mealType:type,meal});}}>📦</button>}
                               <button className="slot-remove" onClick={e=>{e.stopPropagation();removeMeal(day,type);}}>×</button>
@@ -1420,22 +1524,25 @@ Field rules:
             </div>
             <div className="lib-grid">
               {meals.map(meal=>{
-                const t=calcMealTotals(meal.ingredients);
+                const ps=calcPerServing(meal);
                 return (
                   <div key={meal.id} className="meal-card" style={{cursor:"pointer"}} onClick={()=>setViewRecipeModal(meal)}>
                     <div className="mc-top">
                       <span className="mc-emoji">{meal.emoji}</span>
                       <div style={{flex:1}}>
                         <div className="mc-title">{meal.name}</div>
-                        <div className="mc-cals">🔥 {t.calories} cal</div>
+                        <div className="mc-cals">
+                          🔥 {ps.calories} cal{ps.servings>1?<span style={{fontSize:10,fontWeight:400,color:"#aaa"}}> /serving ({ps.servings} srv)</span>:""}
+                        </div>
+                        {meal.rating>0&&<div style={{fontSize:12,color:"#F59E0B"}}>{"⭐".repeat(meal.rating)}</div>}
                         <div className="tags" style={{marginTop:4}}>{meal.tags?.map(tg=><span key={tg} className="tag">{tg}</span>)}</div>
                       </div>
                       <span style={{fontSize:11,color:"#ccc",alignSelf:"flex-start",marginTop:2}}>›</span>
                     </div>
                     <div className="macro-row">
-                      <div className="macro-pill"><strong>{t.protein}g</strong>Protein</div>
-                      <div className="macro-pill"><strong>{t.carbs}g</strong>Carbs</div>
-                      <div className="macro-pill"><strong>{t.fat}g</strong>Fat</div>
+                      <div className="macro-pill"><strong>{ps.protein}g</strong>Protein</div>
+                      <div className="macro-pill"><strong>{ps.carbs}g</strong>Carbs</div>
+                      <div className="macro-pill"><strong>{ps.fat}g</strong>Fat</div>
                     </div>
                     <div style={{marginTop:10,fontSize:11,color:"#aaa"}}>
                       {meal.ingredients.length} ingredient{meal.ingredients.length!==1?"s":""}
@@ -1649,7 +1756,7 @@ Field rules:
                       <div style={{fontWeight:800,fontSize:14,marginBottom:3}}>{s.name}</div>
                       <div style={{fontSize:11,color:"#666",lineHeight:1.55}}>{s.description}</div>
                       <div style={{display:"flex",gap:10,marginTop:7,fontSize:11,color:"#999"}}>
-                        <span>🔥 {t.calories} cal</span><span>💪 {t.protein}g protein</span><span>🌾 {t.carbs}g carbs</span>
+                        <span>🔥 {calcPerServing(s).calories} cal/srv</span><span>💪 {calcPerServing(s).protein}g protein</span><span>🌾 {calcPerServing(s).carbs}g carbs</span>
                       </div>
                     </div>
                     <button className="btn btn-primary btn-xs" onClick={()=>{setMeals(prev=>[...prev,{...s,id:Date.now()}]);setAiSugs(prev=>prev.filter(x=>x.name!==s.name));}}>+ Add</button>
@@ -1683,25 +1790,28 @@ Field rules:
             </div>
             {Object.keys(plan[todayName]||{}).length>0&&(
               <div style={{background:"#fff",borderRadius:14,padding:15,boxShadow:"0 2px 8px rgba(0,0,0,.07)"}}>
-                <div style={{fontWeight:800,fontSize:11,color:"#aaa",textTransform:"uppercase",letterSpacing:".6px",marginBottom:12}}>Today - Per Meal Breakdown</div>
+                <div style={{fontWeight:800,fontSize:11,color:"#aaa",textTransform:"uppercase",letterSpacing:".6px",marginBottom:12}}>Today — Per Meal Breakdown</div>
                 {MEAL_TYPES.map(type=>{
                   const meal=plan[todayName]?.[type]; if(!meal) return null;
-                  const t=calcMealTotals(meal.ingredients);
+                  const ps=calcPerServing(meal);
                   return (
                     <div key={type} className="mb-wrap">
-                      <div style={{display:"flex",justifyContent:"space-between",marginBottom:6}}>
+                      <div style={{display:"flex",justifyContent:"space-between",marginBottom:6,alignItems:"flex-start"}}>
                         <span style={{fontWeight:800}}>{meal.emoji} {meal.name} <span style={{color:"#aaa",fontWeight:400,fontSize:11}}>({type})</span></span>
-                        <span style={{color:"#FF7043",fontWeight:800}}>{t.calories} cal</span>
+                        <div style={{textAlign:"right",flexShrink:0,marginLeft:8}}>
+                          <span style={{color:"#FF7043",fontWeight:800}}>{ps.calories} cal</span>
+                          {ps.servings>1&&<div style={{fontSize:10,color:"#aaa"}}>{ps.totalCalories} total / {ps.servings} srv</div>}
+                        </div>
                       </div>
                       {meal.ingredients.map(ing=>{
-                        const ic=Math.round(ing.qty*ing.calsPerUnit);
+                        const ic=Math.round((ing.qty*ing.calsPerUnit)/ps.servings);
                         return <div key={ing.id} className="mb-row">
-                          <span style={{color:"#666"}}>{ing.name} <span style={{color:"#bbb"}}>({ing.qty} {ing.unit})</span></span>
+                          <span style={{color:"#666"}}>{ing.name} <span style={{color:"#bbb"}}>({Math.round(ing.qty/ps.servings*100)/100} {ing.unit})</span></span>
                           <span style={{fontWeight:700,color:"#888"}}>{ic} cal</span>
                         </div>;
                       })}
                       <div style={{display:"flex",gap:16,marginTop:8,fontSize:11,color:"#aaa"}}>
-                        <span>P: {t.protein}g</span><span>C: {t.carbs}g</span><span>F: {t.fat}g</span>
+                        <span>P: {ps.protein}g</span><span>C: {ps.carbs}g</span><span>F: {ps.fat}g</span>
                       </div>
                     </div>
                   );
@@ -1722,18 +1832,28 @@ Field rules:
                 <button className="btn btn-primary" style={{marginTop:14}} onClick={()=>setTab("planner")}>Go to Planner</button>
               </div>
             ):<>
-              {grocery.filter(i=>i.source==="plan").length>0&&<div className="grocery-sec">
-                <h3>📋 From Your Plan</h3>
-                {grocery.filter(i=>i.source==="plan").map(item=>(
-                  <div key={item.id} className="g-item">
-                    <div className={"g-check"+(checked[item.id]?" on":"")} onClick={()=>setChecked(p=>({...p,[item.id]:!p[item.id]}))}>
-                      {checked[item.id]&&"✓"}
-                    </div>
-                    <div className={"g-text"+(checked[item.id]?" done":"")}>{item.text}</div>
-                    <button className="g-del" onClick={()=>setGrocery(p=>p.filter(i=>i.id!==item.id))}>×</button>
+              {/* Items grouped by store section */}
+              {STORE_SECTIONS.map(section => {
+                const sectionItems = grocery.filter(i =>
+                  i.source==="plan" && section.cats.includes(i.category||"other")
+                );
+                if(sectionItems.length===0) return null;
+                return (
+                  <div key={section.key} className="grocery-sec">
+                    <h3>{section.label}</h3>
+                    {sectionItems.map(item=>(
+                      <div key={item.id} className="g-item">
+                        <div className={"g-check"+(checked[item.id]?" on":"")} onClick={()=>setChecked(p=>({...p,[item.id]:!p[item.id]}))}>
+                          {checked[item.id]&&"✓"}
+                        </div>
+                        <div className={"g-text"+(checked[item.id]?" done":"")}>{item.text}</div>
+                        <button className="g-del" onClick={()=>setGrocery(p=>p.filter(i=>i.id!==item.id))}>×</button>
+                      </div>
+                    ))}
                   </div>
-                ))}
-              </div>}
+                );
+              })}
+              {/* Manual items */}
               {grocery.filter(i=>i.source==="manual").length>0&&<div className="grocery-sec">
                 <h3>✏️ Added by You</h3>
                 {grocery.filter(i=>i.source==="manual").map(item=>(
@@ -1754,38 +1874,62 @@ Field rules:
                 <button className="btn btn-primary btn-sm" onClick={addGrocery}>Add</button>
               </div>
             </div>
-            {grocery.length>0&&<div style={{textAlign:"center",fontSize:11,color:"#ccc",marginTop:4}}>{Object.values(checked).filter(Boolean).length} of {grocery.length} checked</div>}
+            {grocery.length>0&&<div style={{textAlign:"center",fontSize:11,color:"#ccc",marginTop:4}}>
+              {Object.values(checked).filter(Boolean).length} of {grocery.length} items checked
+            </div>}
           </>}
         </div>
 
         {/* MEAL PICKER */}
-        {pickerModal&&<div className="overlay" onClick={()=>{setPickerModal(null);setSearch("");}}>
+        {pickerModal&&<div className="overlay" onClick={()=>{setPickerModal(null);setSearch("");setPickerFilter("all");}}>
           <div className="modal" onClick={e=>e.stopPropagation()}>
-            <button className="modal-close" onClick={()=>{setPickerModal(null);setSearch("");}}>×</button>
+            <button className="modal-close" onClick={()=>{setPickerModal(null);setSearch("");setPickerFilter("all");}}>×</button>
             <h2>Add {pickerModal.mealType}</h2>
             <div style={{fontSize:12,color:"#aaa",marginBottom:14}}>{pickerModal.day}</div>
             <button className="btn btn-secondary" style={{width:"100%",marginBottom:14,justifyContent:"center"}}
-              onClick={()=>{ const {day,mealType}=pickerModal; setPickerModal(null); setSearch(""); openQuickMealModal(day,mealType); }}>
+              onClick={()=>{ const {day,mealType}=pickerModal; setPickerModal(null); setSearch(""); setPickerFilter("all"); openQuickMealModal(day,mealType); }}>
               🥕 Build from Foods (e.g. sandwich + grapes)
             </button>
-            <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:14}}>
+            <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:12}}>
               <div style={{flex:1,height:1,background:"#F0F0F0"}}/>
               <span style={{fontSize:10,color:"#bbb",fontWeight:700,textTransform:"uppercase"}}>or pick a saved meal</span>
               <div style={{flex:1,height:1,background:"#F0F0F0"}}/>
             </div>
+            {/* Cook time filter */}
+            <div style={{display:"flex",gap:6,marginBottom:12}}>
+              {[["all","All meals"],["quick","⚡ Under 30 min"],["rated","⭐ Rated"]].map(([key,label])=>(
+                <button key={key} className={"mt-chip"+(pickerFilter===key?" on":"")} onClick={()=>setPickerFilter(key)}>{label}</button>
+              ))}
+            </div>
             <input className="search-input" autoFocus placeholder="Search meals..." value={search} onChange={e=>setSearch(e.target.value)}/>
-            {filteredMeals.length===0?<div className="empty"><p>No meals found.</p></div>
-              :filteredMeals.map(meal=>{
+            {(()=>{
+              const isQuick = m => {
+                const t = (m.cookTime||"") + (m.prepTime||"") + (m.tags||[]).join(" ");
+                return t.toLowerCase().includes("quick") || t.toLowerCase().includes("30") || t.toLowerCase().includes("15") || t.toLowerCase().includes("20") || (m.tags||[]).includes("quick");
+              };
+              const filtered = filteredMeals.filter(m => {
+                if(pickerFilter==="quick") return isQuick(m);
+                if(pickerFilter==="rated") return m.rating > 0;
+                return true;
+              });
+              if(filtered.length===0) return <div className="empty"><p>No meals match — try a different filter.</p></div>;
+              return filtered.map(meal=>{
                 const t=calcMealTotals(meal.ingredients);
+                const meta = mealMeta[meal.id] || {rating: meal.rating||0, note: meal.note||""};
                 return <div key={meal.id} className="mli" onClick={()=>assignMeal(meal)}>
                   <span className="mli-emoji">{meal.emoji}</span>
-                  <div>
+                  <div style={{flex:1}}>
                     <div className="mli-name">{meal.name}</div>
-                    <div className="mli-meta">🔥 {t.calories} cal · 💪 {t.protein}g protein</div>
+                    <div className="mli-meta">🔥 {calcPerServing(meal).calories} cal/srv · 💪 {calcPerServing(meal).protein}g
+                      {meal.cookTime&&<span> · ⏱️ {meal.cookTime}</span>}
+                    </div>
+                    {meta.rating>0&&<div style={{fontSize:11,color:"#F59E0B"}}>{"⭐".repeat(meta.rating)}</div>}
+                    {meta.note&&<div style={{fontSize:10,color:"#aaa",fontStyle:"italic"}}>{meta.note}</div>}
                     <div className="tags">{meal.tags?.map(tg=><span key={tg} className="tag">{tg}</span>)}</div>
                   </div>
                 </div>;
-              })}
+              });
+            })()}
           </div>
         </div>}
 
@@ -1996,10 +2140,21 @@ Field rules:
         {scanModal&&<div className="overlay" onClick={()=>{setScanModal(false);stopCamera();setScanResult(null);}}>
           <div className="modal" onClick={e=>e.stopPropagation()}>
             <button className="modal-close" onClick={()=>{setScanModal(false);stopCamera();setScanResult(null);}}>×</button>
-            <h2>📷 Scan Nutrition Label</h2>
-            <p style={{fontSize:12,color:"#999",marginBottom:14}}>Point your camera at a nutrition label or upload a photo. AI reads the values automatically.</p>
-            {!scanning&&!scanResult&&!scanLoading&&<div style={{textAlign:"center",padding:"24px 0"}}>
-              <div style={{fontSize:44,marginBottom:12}}>📷</div>
+            <h2>📷 Scan Food</h2>
+
+            {/* Mode toggle */}
+            <div className="import-tabs" style={{marginBottom:14}}>
+              <button className={"import-tab"+(scanMode==="barcode"?" active":"")} onClick={()=>{setScanMode("barcode");setScanResult(null);}}>🔲 Barcode</button>
+              <button className={"import-tab"+(scanMode==="label"?" active":"")} onClick={()=>{setScanMode("label");setScanResult(null);}}>📋 Nutrition Label</button>
+            </div>
+            <p style={{fontSize:12,color:"#999",marginBottom:14}}>
+              {scanMode==="barcode"
+                ? "Scan a barcode to look up nutrition info from Open Food Facts (free database of 3M+ products)."
+                : "Point at a nutrition label and AI will read the values automatically."}
+            </p>
+
+            {!scanning&&!scanResult&&!scanLoading&&<div style={{textAlign:"center",padding:"20px 0"}}>
+              <div style={{fontSize:44,marginBottom:12}}>{scanMode==="barcode"?"🔲":"📋"}</div>
               <div style={{display:"flex",flexDirection:"column",gap:10,alignItems:"center"}}>
                 <button className="btn btn-primary" onClick={startCamera}>Open Camera</button>
                 <label className="btn btn-secondary" style={{cursor:"pointer"}}>
@@ -2008,12 +2163,15 @@ Field rules:
                 </label>
               </div>
             </div>}
+
             {scanning&&<>
               <div className="scanner-area">
                 <video ref={videoRef} className="scanner-video" playsInline muted autoPlay/>
                 <div className="scanner-frame-wrap">
-                  <div className="scanner-frame"/>
-                  <div className="scanner-hint">Align nutrition label within frame</div>
+                  <div className="scanner-frame" style={{width: scanMode==="barcode"?"220px":"180px", height: scanMode==="barcode"?"100px":"130px"}}/>
+                  <div className="scanner-hint">
+                    {scanMode==="barcode" ? "Align barcode within frame" : "Align nutrition label within frame"}
+                  </div>
                 </div>
               </div>
               <canvas ref={canvasRef} style={{display:"none"}}/>
@@ -2022,27 +2180,44 @@ Field rules:
                 <button className="btn btn-secondary" onClick={stopCamera}>Cancel</button>
               </div>
             </>}
+
             {scanLoading&&<div style={{textAlign:"center",padding:"24px 0"}}>
               <div className="spinner" style={{width:30,height:30,borderWidth:4}}/>
-              <div style={{marginTop:12,fontSize:13,color:"#888"}}>Analyzing label...</div>
+              <div style={{marginTop:12,fontSize:13,color:"#888"}}>
+                {scanMode==="barcode" ? "Looking up barcode..." : "Reading nutrition label..."}
+              </div>
             </div>}
+
             {scanResult&&!scanResult.error&&<div className="scan-result-box">
-              <div style={{fontWeight:800,fontSize:14}}>✅ Label Read Successfully</div>
+              <div style={{fontWeight:800,fontSize:14,marginBottom:8}}>✅ Found!</div>
+              {scanResult.image&&<img src={scanResult.image} alt={scanResult.name} style={{width:60,height:60,objectFit:"contain",float:"right",borderRadius:8,marginLeft:10}}/>}
+              <div style={{fontWeight:700,fontSize:15,marginBottom:2}}>{scanResult.name}</div>
+              {scanResult.brand&&<div style={{fontSize:11,color:"#888",marginBottom:8}}>{scanResult.brand}</div>}
+              {scanResult.servingLabel&&<div style={{fontSize:11,color:"#aaa",marginBottom:10}}>Per serving: {scanResult.servingLabel}</div>}
               <div className="scan-result-grid">
-                <div><span style={{color:"#888"}}>Product:</span> <strong>{scanResult.name}</strong></div>
-                <div><span style={{color:"#888"}}>Serving:</span> <strong>{scanResult.servingSize} {scanResult.unit}</strong></div>
-                <div><span style={{color:"#888"}}>Cal/unit:</span> <strong style={{color:"#FF7043"}}>{scanResult.calsPerUnit}</strong></div>
+                <div><span style={{color:"#888"}}>Calories:</span> <strong style={{color:"#FF7043"}}>{scanResult.calsPerUnit}</strong></div>
                 <div><span style={{color:"#888"}}>Protein:</span> <strong>{scanResult.protein}g</strong></div>
                 <div><span style={{color:"#888"}}>Carbs:</span> <strong>{scanResult.carbs}g</strong></div>
                 <div><span style={{color:"#888"}}>Fat:</span> <strong>{scanResult.fat}g</strong></div>
               </div>
-              <div style={{marginTop:12,display:"flex",gap:8,justifyContent:"flex-end"}}>
-                <button className="btn btn-secondary btn-sm" onClick={()=>{setScanResult(null);}}>Scan Again</button>
-                {ingModal&&<button className="btn btn-primary btn-sm" onClick={applyScanResult}>+ Add to Meal</button>}
+              <div style={{marginTop:12,display:"flex",gap:8,justifyContent:"flex-end",flexWrap:"wrap"}}>
+                <button className="btn btn-secondary btn-sm" onClick={()=>{setScanResult(null);setScanMode("barcode");}}>Scan Again</button>
+                <button className="btn btn-primary btn-sm" onClick={applyScanResult}>
+                  {ingModal||quickMealModal ? "+ Add to Meal" : "💾 Save to Foods"}
+                </button>
               </div>
             </div>}
-            {scanResult?.error&&<div style={{background:"#FFF3E0",border:"1.5px solid #FFE0B2",borderRadius:12,padding:14,fontSize:13,color:"#E65100"}}>
-              ⚠️ Could not read label. Try better lighting or a clearer angle.
+
+            {scanResult?.error==="not_found"&&<div style={{background:"#FFF3E0",border:"1.5px solid #FFE0B2",borderRadius:12,padding:14,fontSize:13,color:"#E65100"}}>
+              ⚠️ Barcode <strong>{scanResult.barcode}</strong> not found in the database. Try scanning the nutrition label instead.
+              <div style={{display:"flex",gap:8,marginTop:10}}>
+                <button className="btn btn-secondary btn-xs" onClick={()=>{setScanResult(null);}}>Try Again</button>
+                <button className="btn btn-ghost btn-xs" onClick={()=>{setScanResult(null);setScanMode("label");}}>Scan Label Instead</button>
+              </div>
+            </div>}
+
+            {scanResult?.error&&scanResult.error!=="not_found"&&<div style={{background:"#FFF3E0",border:"1.5px solid #FFE0B2",borderRadius:12,padding:14,fontSize:13,color:"#E65100"}}>
+              ⚠️ Could not read {scanMode==="barcode"?"barcode":"label"}. Try better lighting or a clearer angle.
               <button className="btn btn-secondary btn-xs" style={{marginLeft:12}} onClick={()=>{setScanResult(null);}}>Try Again</button>
             </div>}
           </div>
@@ -2136,55 +2311,110 @@ Field rules:
 
         {/* VIEW RECIPE MODAL */}
         {viewRecipeModal&&(()=>{
-          const t = calcMealTotals(viewRecipeModal.ingredients);
+          const baseServings = viewRecipeModal.servings || 1;
+          const scaledServings = recipeServings || baseServings;
+          const scale = scaledServings / baseServings;
+          const scaledIngs = viewRecipeModal.ingredients.map(ing => ({
+            ...ing, qty: Math.round(ing.qty * scale * 100) / 100
+          }));
+          const totalT = calcMealTotals(scaledIngs);
+          // Per-serving values (what one person eats)
+          const t = {
+            calories: Math.round(totalT.calories / scaledServings),
+            protein:  Math.round(totalT.protein  / scaledServings),
+            carbs:    Math.round(totalT.carbs    / scaledServings),
+            fat:      Math.round(totalT.fat      / scaledServings),
+          };
+          const meta = mealMeta[viewRecipeModal.id] || {rating: viewRecipeModal.rating||0, note: viewRecipeModal.note||""};
           return (
-          <div className="overlay" onClick={()=>setViewRecipeModal(null)}>
+          <div className="overlay" onClick={()=>{setViewRecipeModal(null);setRecipeServings(null);}}>
             <div className="modal modal-lg" onClick={e=>e.stopPropagation()} style={{maxHeight:"94vh",padding:0,overflow:"hidden",display:"flex",flexDirection:"column"}}>
 
               {/* Header */}
-              <div style={{padding:"20px 22px 16px",borderBottom:"1px solid #F0F0F0",flexShrink:0}}>
-                <button className="modal-close" onClick={()=>setViewRecipeModal(null)} style={{marginBottom:0}}>×</button>
-                <div style={{display:"flex",gap:14,alignItems:"flex-start"}}>
-                  <span style={{fontSize:42,lineHeight:1}}>{viewRecipeModal.emoji}</span>
+              <div style={{padding:"18px 20px 14px",borderBottom:"1px solid #F0F0F0",flexShrink:0}}>
+                <button className="modal-close" onClick={()=>{setViewRecipeModal(null);setRecipeServings(null);}}>×</button>
+                <div style={{display:"flex",gap:12,alignItems:"flex-start"}}>
+                  <span style={{fontSize:38,lineHeight:1}}>{viewRecipeModal.emoji}</span>
                   <div style={{flex:1,minWidth:0}}>
-                    <div style={{fontSize:18,fontWeight:800,letterSpacing:"-0.4px",lineHeight:1.2,marginBottom:6}}>{viewRecipeModal.name}</div>
-                    <div style={{display:"flex",gap:12,flexWrap:"wrap",fontSize:12,color:"#888",marginBottom:6}}>
-                      {viewRecipeModal.servings&&<span>🍽️ {viewRecipeModal.servings} servings</span>}
+                    <div style={{fontSize:17,fontWeight:800,letterSpacing:"-0.4px",lineHeight:1.2,marginBottom:4}}>{viewRecipeModal.name}</div>
+                    {/* Star rating */}
+                    <div style={{display:"flex",gap:2,marginBottom:6}}>
+                      {[1,2,3,4,5].map(star=>(
+                        <button key={star} onClick={()=>{
+                          const newRating = meta.rating===star ? 0 : star;
+                          saveMealMeta(viewRecipeModal.id, newRating, meta.note||"");
+                          setMealMeta(p=>({...p,[viewRecipeModal.id]:{...meta,rating:newRating}}));
+                        }} style={{background:"none",border:"none",cursor:"pointer",fontSize:18,padding:"0 1px",
+                          color: star<=(meta.rating||0) ? "#F59E0B" : "#DDD"}}>★</button>
+                      ))}
+                      <span style={{fontSize:11,color:"#aaa",marginLeft:4,alignSelf:"center"}}>
+                        {meta.rating>0 ? ["","Not great","It was ok","Pretty good","Really good","Absolutely love it!"][meta.rating] : "Rate this meal"}
+                      </span>
+                    </div>
+                    <div style={{display:"flex",gap:10,flexWrap:"wrap",fontSize:11,color:"#888",marginBottom:6}}>
                       {viewRecipeModal.prepTime&&<span>⏱️ {viewRecipeModal.prepTime} prep</span>}
                       {viewRecipeModal.cookTime&&<span>🔥 {viewRecipeModal.cookTime} cook</span>}
                     </div>
-                    {/* Macro pills */}
-                    <div style={{display:"flex",gap:6,marginTop:4}}>
+                    {/* Macro pills — per serving */}
+                    <div style={{display:"flex",gap:5,flexWrap:"wrap",alignItems:"center"}}>
                       {[["🔥",t.calories,"cal"],["💪",t.protein+"g","protein"],["🌾",t.carbs+"g","carbs"],["🥑",t.fat+"g","fat"]].map(([icon,val,lbl])=>(
-                        <div key={lbl} style={{background:"#F5F5F5",borderRadius:8,padding:"4px 8px",fontSize:11,textAlign:"center"}}>
-                          <span style={{fontWeight:800}}>{icon} {val}</span><span style={{color:"#aaa",marginLeft:3}}>{lbl}</span>
+                        <div key={lbl} style={{background:"#F5F5F5",borderRadius:8,padding:"3px 7px",fontSize:10,textAlign:"center"}}>
+                          <span style={{fontWeight:800}}>{icon} {val}</span><span style={{color:"#aaa",marginLeft:2}}>{lbl}</span>
                         </div>
                       ))}
+                      <span style={{fontSize:10,color:"#aaa",marginLeft:2}}>per serving</span>
                     </div>
                   </div>
+                </div>
+                {/* Serving scaler */}
+                <div style={{display:"flex",alignItems:"center",gap:10,marginTop:12,padding:"10px 12px",background:"#F8F8F8",borderRadius:10}}>
+                  <span style={{fontSize:12,fontWeight:700,color:"#555"}}>Servings:</span>
+                  <button onClick={()=>setRecipeServings(Math.max(1,scaledServings-1))} style={{background:"#fff",border:"1.5px solid #DDD",borderRadius:6,width:28,height:28,cursor:"pointer",fontSize:16,display:"flex",alignItems:"center",justifyContent:"center"}}>−</button>
+                  <span style={{fontWeight:800,fontSize:16,minWidth:24,textAlign:"center"}}>{scaledServings}</span>
+                  <button onClick={()=>setRecipeServings(scaledServings+1)} style={{background:"#fff",border:"1.5px solid #DDD",borderRadius:6,width:28,height:28,cursor:"pointer",fontSize:16,display:"flex",alignItems:"center",justifyContent:"center"}}>+</button>
+                  <span style={{fontSize:11,color:"#aaa"}}>(base: {baseServings})</span>
+                  {scaledServings!==baseServings&&<button onClick={()=>setRecipeServings(null)} style={{marginLeft:"auto",background:"none",border:"none",color:"#4CAF50",fontSize:11,fontWeight:700,cursor:"pointer"}}>Reset</button>}
                 </div>
                 {viewRecipeModal.sourceUrl&&<a href={viewRecipeModal.sourceUrl} target="_blank" rel="noreferrer" style={{display:"inline-flex",alignItems:"center",gap:4,marginTop:10,fontSize:11,color:"#4CAF50",textDecoration:"none",fontWeight:700}}>🔗 {viewRecipeModal.sourceName||"View original recipe"}</a>}
               </div>
 
               {/* Scrollable body */}
-              <div style={{overflowY:"auto",flex:1,padding:"16px 22px 20px"}}>
+              <div style={{overflowY:"auto",flex:1,padding:"14px 20px 20px"}}>
 
-                {/* Ingredients */}
-                <div style={{fontWeight:800,fontSize:11,color:"#aaa",textTransform:"uppercase",letterSpacing:".6px",marginBottom:10}}>
-                  Ingredients ({viewRecipeModal.ingredients.length})
+                {/* Ingredients — full recipe quantities */}
+                <div style={{fontWeight:800,fontSize:11,color:"#aaa",textTransform:"uppercase",letterSpacing:".6px",marginBottom:8}}>
+                  Ingredients ({scaledIngs.length})
+                  {scale!==1&&<span style={{color:"#4CAF50",marginLeft:6,fontWeight:700}}>scaled {scale>1?"up":"down"}</span>}
                 </div>
-                <div style={{background:"#FAFAFA",borderRadius:12,padding:"4px 0",marginBottom:20}}>
-                  {viewRecipeModal.ingredients.map((ing,i)=>{
+                <div style={{background:"#FAFAFA",borderRadius:12,padding:"4px 0",marginBottom:18}}>
+                  {scaledIngs.map((ing,i)=>{
                     const ic = Math.round(ing.qty * ing.calsPerUnit);
-                    const displayAmt = ing.raw || `${ing.qty} ${ing.unit} ${ing.name}`;
+                    const displayQty = Number.isInteger(ing.qty) ? ing.qty : Math.round(ing.qty*100)/100;
+                    const displayAmt = ing.raw && scale===1 ? ing.raw : `${displayQty} ${ing.unit} ${ing.name}`;
                     return (
-                      <div key={i} style={{display:"flex",alignItems:"center",gap:10,padding:"9px 14px",borderBottom:i<viewRecipeModal.ingredients.length-1?"1px solid #F0F0F0":"none"}}>
+                      <div key={i} style={{display:"flex",alignItems:"center",gap:10,padding:"9px 14px",borderBottom:i<scaledIngs.length-1?"1px solid #F0F0F0":"none"}}>
                         <span style={{color:"#4CAF50",fontSize:14,flexShrink:0}}>·</span>
                         <span style={{flex:1,fontSize:13,color:"#1A1A2E"}}>{displayAmt}</span>
                         {ic>0&&<span style={{fontSize:11,color:"#FF7043",fontWeight:700,flexShrink:0}}>{ic} cal</span>}
                       </div>
                     );
                   })}
+                </div>
+
+                {/* Notes */}
+                <div style={{marginBottom:16}}>
+                  <div style={{fontWeight:800,fontSize:11,color:"#aaa",textTransform:"uppercase",letterSpacing:".6px",marginBottom:8}}>Notes</div>
+                  <textarea
+                    placeholder="Add a note — e.g. 'add more garlic next time', 'kids loved this'..."
+                    value={meta.note||""}
+                    onChange={e=>{
+                      const note=e.target.value;
+                      setMealMeta(p=>({...p,[viewRecipeModal.id]:{...meta,note}}));
+                    }}
+                    onBlur={e=>saveMealMeta(viewRecipeModal.id, meta.rating||0, e.target.value)}
+                    style={{width:"100%",padding:"9px 12px",border:"1.5px solid #EEE",borderRadius:9,fontSize:12,
+                      fontFamily:"inherit",outline:"none",resize:"none",minHeight:70,lineHeight:1.5}}
+                  />
                 </div>
 
                 {/* Directions */}
@@ -2199,15 +2429,15 @@ Field rules:
                     </div>
                   ))}
                 </> : <div style={{background:"#FFFBF0",border:"1.5px dashed #FFE082",borderRadius:12,padding:14,fontSize:13,color:"#888",textAlign:"center"}}>
-                  No directions saved for this meal.<br/>
-                  <span style={{fontSize:11,marginTop:4,display:"block"}}>Import a recipe via URL or Paste Text to get step-by-step directions.</span>
+                  No directions saved yet.
+                  <span style={{fontSize:11,marginTop:4,display:"block"}}>Import a recipe to get step-by-step directions.</span>
                 </div>}
               </div>
 
-              {/* Footer actions */}
-              <div style={{padding:"12px 22px",borderTop:"1px solid #F0F0F0",display:"flex",gap:8,justifyContent:"flex-end",flexShrink:0,background:"#fff"}}>
-                <button className="btn btn-ghost btn-sm" onClick={()=>{setViewRecipeModal(null);openLibIngModal(viewRecipeModal);}}>✏️ Edit Nutrition</button>
-                <button className="btn btn-secondary btn-sm" onClick={()=>setViewRecipeModal(null)}>Close</button>
+              {/* Footer */}
+              <div style={{padding:"10px 20px",borderTop:"1px solid #F0F0F0",display:"flex",gap:8,justifyContent:"flex-end",flexShrink:0,background:"#fff"}}>
+                <button className="btn btn-ghost btn-sm" onClick={()=>{setViewRecipeModal(null);setRecipeServings(null);openLibIngModal(viewRecipeModal);}}>✏️ Edit Nutrition</button>
+                <button className="btn btn-secondary btn-sm" onClick={()=>{setViewRecipeModal(null);setRecipeServings(null);}}>Close</button>
               </div>
             </div>
           </div>
