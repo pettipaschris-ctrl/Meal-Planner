@@ -712,6 +712,7 @@ function App() {
   // ── Food Library state ───────────────────────────────────────────────────────
   const [foodSearch, setFoodSearch] = useState("");
   const [addFoodModal, setAddFoodModal] = useState(false);
+  const [editFoodModal, setEditFoodModal] = useState(null); // food object being edited
   const [newFood, setNewFood] = useState({name:"",unit:"g",calsPerUnit:"",protein:"",carbs:"",fat:"",category:"other"});
 
   // ── Quick Meal Builder (compose a meal from individual foods, e.g. sandwich + grapes) ──
@@ -959,6 +960,22 @@ function App() {
     setMealMeta(prev => ({...prev, [mealId]: {rating, note}}));
     // Also update the meal in library
     setMeals(prev => prev.map(m => m.id===mealId ? {...m, rating, note} : m));
+  };
+
+  // Save edits to an existing food in the library
+  const saveEditFood = () => {
+    if(!editFoodModal) return;
+    setFoods(prev => prev.map(f => f.id===editFoodModal.id ? {
+      ...f,
+      name: editFoodModal.name,
+      unit: editFoodModal.unit,
+      calsPerUnit: parseFloat(editFoodModal.calsPerUnit)||0,
+      protein: parseFloat(editFoodModal.protein)||0,
+      carbs: parseFloat(editFoodModal.carbs)||0,
+      fat: parseFloat(editFoodModal.fat)||0,
+      category: editFoodModal.category||"other"
+    } : f));
+    setEditFoodModal(null);
   };
 
   // Camera
@@ -1594,8 +1611,11 @@ Field rules:
               return (
                 <div className="food-grid">
                   {filtered.map(food=>(
-                    <div key={food.id} className="food-card">
-                      <div className="food-card-name">{food.name}</div>
+                    <div key={food.id} className="food-card" style={{cursor:"pointer"}} onClick={()=>setEditFoodModal({...food, calsPerUnit: String(food.calsPerUnit), protein: String(food.protein), carbs: String(food.carbs), fat: String(food.fat)})}>
+                      <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
+                        <div className="food-card-name">{food.name}</div>
+                        <span style={{fontSize:11,color:"#ccc"}}>›</span>
+                      </div>
                       <span className={"food-cat-badge cat-"+(food.category||"other")}>{food.category||"other"}</span>
                       <div className="food-card-nutrition" style={{marginTop:8}}>
                         <span><strong>{Math.round(food.calsPerUnit)}</strong> cal</span>
@@ -2036,6 +2056,50 @@ Field rules:
           </div>
         </div>}
 
+        {/* EDIT FOOD MODAL */}
+        {editFoodModal&&<div className="overlay" onClick={()=>setEditFoodModal(null)}>
+          <div className="modal" onClick={e=>e.stopPropagation()}>
+            <button className="modal-close" onClick={()=>setEditFoodModal(null)}>×</button>
+            <h2>✏️ Edit Food</h2>
+            <div className="fg">
+              <label className="fl">Food Name</label>
+              <input className="fi" value={editFoodModal.name} onChange={e=>setEditFoodModal(p=>({...p,name:e.target.value}))}/>
+            </div>
+            <div className="frow">
+              <div className="fg">
+                <label className="fl">Unit</label>
+                <input className="fi" placeholder="g, slice, cup, tbsp..." value={editFoodModal.unit} onChange={e=>setEditFoodModal(p=>({...p,unit:e.target.value}))}/>
+              </div>
+              <div className="fg">
+                <label className="fl">Calories per unit</label>
+                <input className="fi" type="number" value={editFoodModal.calsPerUnit} onChange={e=>setEditFoodModal(p=>({...p,calsPerUnit:e.target.value}))}/>
+              </div>
+            </div>
+            <div className="frow">
+              <div className="fg"><label className="fl">Protein (g)</label><input className="fi" type="number" value={editFoodModal.protein} onChange={e=>setEditFoodModal(p=>({...p,protein:e.target.value}))}/></div>
+              <div className="fg"><label className="fl">Carbs (g)</label><input className="fi" type="number" value={editFoodModal.carbs} onChange={e=>setEditFoodModal(p=>({...p,carbs:e.target.value}))}/></div>
+            </div>
+            <div className="frow">
+              <div className="fg"><label className="fl">Fat (g)</label><input className="fi" type="number" value={editFoodModal.fat} onChange={e=>setEditFoodModal(p=>({...p,fat:e.target.value}))}/></div>
+              <div className="fg">
+                <label className="fl">Category</label>
+                <select className="fi" value={editFoodModal.category||"other"} onChange={e=>setEditFoodModal(p=>({...p,category:e.target.value}))}>
+                  {["produce","meat","dairy","grains","seafood","condiments","pantry","snacks","other"].map(c=>(
+                    <option key={c} value={c}>{c.charAt(0).toUpperCase()+c.slice(1)}</option>
+                  ))}
+                </select>
+              </div>
+            </div>
+            <div style={{display:"flex",gap:8,justifyContent:"space-between",marginTop:4}}>
+              <button className="btn btn-danger btn-sm" onClick={()=>{setFoods(prev=>prev.filter(f=>f.id!==editFoodModal.id));setEditFoodModal(null);}}>🗑 Delete</button>
+              <div style={{display:"flex",gap:8}}>
+                <button className="btn btn-secondary" onClick={()=>setEditFoodModal(null)}>Cancel</button>
+                <button className="btn btn-primary" onClick={saveEditFood}>Save</button>
+              </div>
+            </div>
+          </div>
+        </div>}
+
         {/* ADD FOOD MODAL */}
         {addFoodModal&&<div className="overlay" onClick={()=>setAddFoodModal(false)}>
           <div className="modal" onClick={e=>e.stopPropagation()}>
@@ -2189,19 +2253,42 @@ Field rules:
             </div>}
 
             {scanResult&&!scanResult.error&&<div className="scan-result-box">
-              <div style={{fontWeight:800,fontSize:14,marginBottom:8}}>✅ Found!</div>
-              {scanResult.image&&<img src={scanResult.image} alt={scanResult.name} style={{width:60,height:60,objectFit:"contain",float:"right",borderRadius:8,marginLeft:10}}/>}
-              <div style={{fontWeight:700,fontSize:15,marginBottom:2}}>{scanResult.name}</div>
-              {scanResult.brand&&<div style={{fontSize:11,color:"#888",marginBottom:8}}>{scanResult.brand}</div>}
-              {scanResult.servingLabel&&<div style={{fontSize:11,color:"#aaa",marginBottom:10}}>Per serving: {scanResult.servingLabel}</div>}
-              <div className="scan-result-grid">
-                <div><span style={{color:"#888"}}>Calories:</span> <strong style={{color:"#FF7043"}}>{scanResult.calsPerUnit}</strong></div>
-                <div><span style={{color:"#888"}}>Protein:</span> <strong>{scanResult.protein}g</strong></div>
-                <div><span style={{color:"#888"}}>Carbs:</span> <strong>{scanResult.carbs}g</strong></div>
-                <div><span style={{color:"#888"}}>Fat:</span> <strong>{scanResult.fat}g</strong></div>
+              <div style={{fontWeight:800,fontSize:14,marginBottom:10}}>✅ Review & Edit Before Saving</div>
+              {scanResult.image&&<img src={scanResult.image} alt={scanResult.name} style={{width:56,height:56,objectFit:"contain",float:"right",borderRadius:8,marginLeft:10,marginBottom:8}}/>}
+              <div className="frow" style={{marginBottom:8}}>
+                <div className="fg" style={{margin:0,gridColumn:"1/-1"}}>
+                  <label className="fl">Name</label>
+                  <input className="fi" style={{fontSize:13}} value={scanResult.name||""} onChange={e=>setScanResult(p=>({...p,name:e.target.value}))}/>
+                </div>
               </div>
-              <div style={{marginTop:12,display:"flex",gap:8,justifyContent:"flex-end",flexWrap:"wrap"}}>
-                <button className="btn btn-secondary btn-sm" onClick={()=>{setScanResult(null);setScanMode("barcode");}}>Scan Again</button>
+              {scanResult.brand&&<div style={{fontSize:11,color:"#888",marginBottom:8}}>Brand: {scanResult.brand}</div>}
+              {scanResult.servingLabel&&<div style={{fontSize:11,color:"#aaa",marginBottom:10}}>Per: {scanResult.servingLabel}</div>}
+              <div className="frow" style={{marginBottom:6}}>
+                <div className="fg" style={{margin:0}}>
+                  <label className="fl">Calories / unit</label>
+                  <input className="fi" style={{fontSize:13}} type="number" value={scanResult.calsPerUnit||0} onChange={e=>setScanResult(p=>({...p,calsPerUnit:parseFloat(e.target.value)||0}))}/>
+                </div>
+                <div className="fg" style={{margin:0}}>
+                  <label className="fl">Unit</label>
+                  <input className="fi" style={{fontSize:13}} value={scanResult.unit||"serving"} onChange={e=>setScanResult(p=>({...p,unit:e.target.value}))}/>
+                </div>
+              </div>
+              <div className="frow" style={{marginBottom:10}}>
+                <div className="fg" style={{margin:0}}>
+                  <label className="fl">Protein (g)</label>
+                  <input className="fi" style={{fontSize:13}} type="number" value={scanResult.protein||0} onChange={e=>setScanResult(p=>({...p,protein:parseFloat(e.target.value)||0}))}/>
+                </div>
+                <div className="fg" style={{margin:0}}>
+                  <label className="fl">Carbs (g)</label>
+                  <input className="fi" style={{fontSize:13}} type="number" value={scanResult.carbs||0} onChange={e=>setScanResult(p=>({...p,carbs:parseFloat(e.target.value)||0}))}/>
+                </div>
+                <div className="fg" style={{margin:0}}>
+                  <label className="fl">Fat (g)</label>
+                  <input className="fi" style={{fontSize:13}} type="number" value={scanResult.fat||0} onChange={e=>setScanResult(p=>({...p,fat:parseFloat(e.target.value)||0}))}/>
+                </div>
+              </div>
+              <div style={{display:"flex",gap:8,justifyContent:"flex-end",flexWrap:"wrap"}}>
+                <button className="btn btn-secondary btn-sm" onClick={()=>{setScanResult(null);}}>Scan Again</button>
                 <button className="btn btn-primary btn-sm" onClick={applyScanResult}>
                   {ingModal||quickMealModal ? "+ Add to Meal" : "💾 Save to Foods"}
                 </button>
